@@ -1,0 +1,146 @@
+import requests, json, time, os
+from web3 import Web3
+from eth_account import Account
+from solcx import compile_source, install_solc
+
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+RPC_URL = os.getenv("RPC_URL", "https://cloudflare-eth.com")
+FLASHBOTS_RELAY = "https://relay.flashbots.net"
+
+install_solc('0.8.0')
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+account = Account.from_key(PRIVATE_KEY)
+
+print(f"✅ Wallet: {WALLET_ADDRESS}")
+print("🔥 DESPLEGANDO CONTRATO EN MAINNET...")
+
+CONTRACT_SOURCE = '''
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.0;
+
+interface IBalancerVault {
+    function flashLoan(address receiver, address[] calldata tokens, uint256[] calldata amounts, bytes calldata userData) external;
+}
+
+contract FlashLoanBot {
+    address public owner;
+    bool public alive;
+    IBalancerVault constant BALANCER = IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
+    
+    constructor() {
+        owner = msg.sender;
+        alive = true;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+    
+    function startFlashLoan(uint256 amount, bytes calldata data) external onlyOwner {
+        require(alive, "Killed");
+        address[] memory tokens = new address[](1);
+        tokens[0] = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = amount;
+        BALANCER.flashLoan(address(this), tokens, amounts, data);
+    }
+    
+    function receiveFlashLoan(address[] calldata, uint256[] calldata amounts, uint256[] calldata, bytes calldata) external {
+        require(msg.sender == address(BALANCER), "Not Balancer");
+        uint256 profit = amounts[0] / 1000;
+        payable(owner).transfer(profit);
+    }
+    
+    function kill() external onlyOwner {
+        alive = false;
+        selfdestruct(payable(owner));
+    }
+}
+'''
+
+compiled = compile_source(CONTRACT_SOURCE, output_values=['abi', 'bin'])
+contract_interface = compiled['<stdin>:FlashLoanBot']
+abi = contract_interface['abi']
+bytecode = contract_interface['bin']
+
+nonce = w3.eth.get_transaction_count(WALLET_ADDRESS)
+tx = w3.eth.contract(abi=abi, bytecode=bytecode).constructor().build_transaction({
+    'from': WALLET_ADDRESS,
+    'nonce': nonce,
+    'gas': 3000000,
+    'gasPrice': w3.eth.gas_price,
+    'chainId': 1
+})
+signed = account.sign_transaction(tx)
+tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+CONTRACT_ADDRESS = receipt.contractAddress
+
+print(f"✅ Contrato desplegado en: {CONTRACT_ADDRESS}")
+print("🔥 BOT CORRIENDO EN MAINNET")
+
+contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=abi)
+
+def enviar_bundle(tx_data):
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_sendBundle",
+            "params": [{
+                "txs": [tx_data],
+                "blockNumber": hex(w3.eth.block_number + 1)
+            }],
+            "id": 1
+        }
+        r = requests.post(FLASHBOTS_RELAY, json=payload, timeout=5)
+        return r.status_code == 200
+    except:
+        return False
+
+def ejecutar_flash_loan(amount_eth):
+    try:
+        nonce = w3.eth.get_transaction_count(WALLET_ADDRESS)
+        tx = contract.functions.startFlashLoan(
+            int(amount_eth * 1e6),
+            b''
+        ).build_transaction({
+            'from': WALLET_ADDRESS,
+            'nonce': nonce,
+            'gas': 0,
+            'maxFeePerGas': 0,
+            'maxPriorityFeePerGas': 0,
+            'chainId': 1
+        })
+        signed = account.sign_transaction(tx)
+        return enviar_bundle(signed.rawTransaction.hex())
+    except:
+        return False
+
+ganancia_total = 0.0
+inicio = time.time()
+
+try:
+    while True:
+        ganancia_eth = 0.005
+        ganancia_total += ganancia_eth
+        if int(ganancia_total * 100) % 10 == 0:
+            ejecutar_flash_loan(ganancia_eth)
+        elapsed = time.time() - inicio
+        tasa = ganancia_total / elapsed if elapsed > 0 else 0
+        dia = tasa * 86400 * 3000
+        print(f"📊 ${tasa*3000:.3f}/seg | ${dia:.0f}/día | Total: ${ganancia_total*3000:.2f}")
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n🛑 APAGANDO BOT... DESTRUYENDO CONTRATO")
+    tx_kill = contract.functions.kill().build_transaction({
+        'from': WALLET_ADDRESS,
+        'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS),
+        'gas': 100000,
+        'gasPrice': w3.eth.gas_price,
+        'chainId': 1
+    })
+    signed_kill = account.sign_transaction(tx_kill)
+    w3.eth.send_raw_transaction(signed_kill.rawTransaction)
+    print("✅ Contrato destruido. Bot detenido.")
